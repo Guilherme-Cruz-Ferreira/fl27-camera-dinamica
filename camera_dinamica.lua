@@ -7,7 +7,7 @@
 --          F7 = "estou atacando para a DIREITA"   F8 = "estou atacando para a ESQUERDA"
 -- Configuracao: camera_dinamica.ini (na pasta do Sider); Shift+R recarrega.
 local m = {}
-m.version = "1.2"
+m.version = "1.2.1"
 
 -- ===== enderecos (FL27, exe sem ASLR; validados em 2026-11-06) =====
 local G_OFF     = 0x36f3dc8   -- ponteiro do gerenciador da partida
@@ -167,6 +167,7 @@ local function dump_nodes(g)   -- diagnostico (1x): o que ha nos nos de G, para 
     end
 end
 
+local cand = nil
 local function get_ball(g)
     if ball_node then
         local x, y, z = read_ball_checked(g, ball_node)
@@ -182,13 +183,27 @@ local function get_ball(g)
             return x, y, z
         end
     end
+    -- faixa larga (so para modos desconhecidos, ex. Master League): um candidato so vale
+    -- depois de se MOVER varias vezes; dado parado nunca e bola
+    if cand then
+        local x, y, z = read_ball_checked(g, cand.n)
+        if not x then
+            cand = nil
+        else
+            if math.abs(x - cand.x) > 0.05 or math.abs(z - cand.z) > 0.05 then cand.moves = cand.moves + 1 end
+            cand.x, cand.z = x, z
+            if cand.moves >= 8 then
+                ball_node = cand.n
+                log(string.format("camera_dinamica: bola encontrada no no 0x%x (faixa ampla, confirmada por movimento)", cand.n))
+                cand = nil
+                return x, y, z
+            end
+        end
+        return nil
+    end
     for n = 0xe2, BALL_NODE_MIN, -1 do
         local x, y, z = read_ball_checked(g, n)
-        if x then
-            ball_node = n
-            log(string.format("camera_dinamica: bola encontrada no no 0x%x (faixa ampla)", n))
-            return x, y, z
-        end
+        if x then cand = { n = n, x = x, z = z, moves = 0 }; break end
     end
     return nil
 end

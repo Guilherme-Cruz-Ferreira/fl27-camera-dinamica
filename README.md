@@ -62,7 +62,12 @@ The Dynamic Wide camera reads its distance (`0x14260b8fc`, 28.7 by default) and 
 `tools/camtune.lua` is a live tuner for discovering what each camera parameter does.
 
 ## Known issues
-- **Master League:** reported as not working there while Exhibition works. The ball sits in different memory nodes depending on the mode (match vs. training already differ), so v1.2 widens the ball search. This is **not confirmed fixed**: if the overlay shows "bola nao encontrada" (ball not found), the module writes a `DIAGNOSTICO` list of memory nodes to `sider.log` after ~4 s — please open an issue and paste that block.
+- **Master League:** reported as not working there while Exhibition works. The ball sits in different memory nodes depending on the mode (match vs. training already differ), so the module also tries a wider search. This is **not confirmed fixed**: if the overlay shows "bola nao encontrada" (ball not found), the module writes a `DIAGNOSTICO` list of memory nodes to `sider.log` after ~4 s — please open an issue and paste that block.
+
+## Changelog
+- **1.2.1** — Fixes a regression in 1.2: the wider ball search could latch onto a stray, static memory node and the camera stopped reacting (symmetric/dynamic mode "dead"). The wide search now only accepts a candidate after it has actually moved several times; the known node range is always tried first. **If you installed 1.2, update.**
+- **1.2** — Extra opening near touchlines (`side_*`), wider ball search, diagnostic dump, F6 only with the overlay page open.
+- **1.0** — Initial release.
 
 ## Credits
 - [Sider](https://github.com/juce/sider) by juce, and the `camera.lua` module that ships with SP Football Life.
