@@ -1,4 +1,4 @@
--- camera_dinamica.lua  v1.4
+-- camera_dinamica.lua  v2.0
 -- Camera ABERTA na defesa/meio e FECHADA (sua Dynamic Wide custom) perto do gol adversario.
 -- Parametros (descobertos com o camtune): distancia da camera da Dynamic Wide = 0x14260b8fc
 --   (28.70 original; valor alto = camera longe/aberta, valor baixo = perto).
@@ -7,7 +7,7 @@
 --          F7 = "estou atacando para a DIREITA"   F8 = "estou atacando para a ESQUERDA"
 -- Configuracao: camera_dinamica.ini (na pasta do Sider); Shift+R recarrega.
 local m = {}
-m.version = "1.4"
+m.version = "2.0"
 
 -- ===== enderecos (FL27, exe sem ASLR; validados em 2026-11-06) =====
 local G_OFF     = 0x36f3dc8   -- ponteiro do gerenciador da partida
@@ -43,14 +43,19 @@ local cfg = {
     side_height = 25,          -- altura extra na lateral
     side_top = 1.0,            -- ganho na lateral de CIMA (z negativo, onde o campo some)
     side_bottom = 0.3,         -- ganho na lateral de BAIXO
-    smooth = 0.05,             -- 0..1, suavizacao por frame (menor = mais lento)
+    follow = 0.6,              -- segundos: a camera decide pelo 'lugar da jogada' (bola filtrada), nao pela bola instantanea
+    transition = 0.9,          -- segundos para a camera atingir a velocidade de cruzeiro (maior = arranque/freada mais suaves)
+    min_time = 2.5,            -- tempo minimo (s) para percorrer TODO o curso abrir<->fechar (limite de velocidade fisico)
+    side_in_close = 0.35,      -- 0..1: quanto do extra da lateral continua na vista FECHADA (0 = nenhum)
+    max_speed = 1.0,           -- (obsoleto desde a 2.0)
+    smooth = 0.05,             -- (obsoleto desde a 1.5; mantido para nao quebrar o .ini)
     dist_open = 40.0,   dist_close = 28.698,
     lat_open = 21.921,  lat_close = 21.921,
     angle_open = 0.20,  angle_close = 0.20,
     height_open = 90.0, height_close = 35.442,
 }
 local cfg_order = { "enabled", "debug", "first_half_dir", "near_start", "near_end",
-    "def_start", "def_end", "def_strength", "side_start", "side_end", "side_dist", "side_height", "side_top", "side_bottom", "smooth",
+    "def_start", "def_end", "def_strength", "side_start", "side_end", "side_dist", "side_height", "side_top", "side_bottom", "follow", "transition", "min_time", "side_in_close", "max_speed", "smooth",
     "dist_open", "dist_close", "lat_open", "lat_close", "angle_open", "angle_close",
     "height_open", "height_close" }
 
@@ -102,7 +107,10 @@ local EDIT = {
     { "lateral: altura extra",           "side_height",  2,    0,   150 },
     { "lateral de CIMA (ganho 0..1)",    "side_top",     0.1,  0,   2   },
     { "lateral de BAIXO (ganho 0..1)",   "side_bottom",  0.1,  0,   2   },
-    { "suavizacao (menor = mais lento)", "smooth",       0.01, 0.01, 1  },
+    { "arranque/freada: segundos (maior = mais suave)", "transition", 0.1, 0.2, 6  },
+    { "seguir a jogada: segundos (maior = menos nervoso)", "follow", 0.1, 0, 3 },
+    { "tempo minimo abrir<->fechar (s)", "min_time",     0.25, 0.5, 10 },
+    { "lateral que sobra na vista FECHADA (0..1)", "side_in_close", 0.05, 0, 1 },
     { "ligado (1) / desligado (0)",      "enabled",      1,    0,   1   },
 }
 local sel = 1
@@ -122,6 +130,7 @@ local mode = 0                 -- 0 dinamico, 1 forcar FECHADA, 2 forcar ABERTA,
 local mode_names = { [0] = "dinamico", "forcar FECHADA", "forcar ABERTA", "desligado" }
 local t_smooth = 0             -- 0 = aberta, 1 = fechada
 local side_smooth = 0          -- abertura extra perto das laterais (0..1)
+local play_x, play_z = nil, nil      -- 'lugar da jogada': bola filtrada
 local calib = nil              -- { gk=indice, s0=sinal do goleiro, dir0=direcao, cur=sinal atual }
 local pending_auto = false
 local last_info = "aguardando partida"
@@ -279,28 +288,44 @@ local function get_ball(g)
     return nil
 end
 
--- ===== tempo: suavizacao independente do FPS =====
--- cfg.smooth continua sendo "fracao por quadro a 60 FPS"; aqui vira fracao para o tempo real do quadro
-local last_clock, dt_avg, use_clock, clock_frames = nil, 1 / 60, true, 0
+-- ===== tempo real e suavizacao =====
+-- FPS medido pelo relogio de PAREDE (os.time muda a cada segundo real). os.clock NAO serve: mede tempo de CPU do
+-- processo inteiro (todas as threads), que no jogo anda 3-5x mais rapido que o tempo real.
+local wt_last, wt_frames, fps_est, wt_valid = nil, 0, 60, false
 local function frame_dt()
-    if not (use_clock and os and os.clock) then return 1 / 60 end
-    local c = os.clock()
-    local dt = last_clock and (c - last_clock) or (1 / 60)
-    last_clock = c
-    if dt <= 0 or dt > 0.25 then return 1 / 60 end      -- pausa, carregamento, 1o quadro
-    dt_avg = dt_avg + (dt - dt_avg) * 0.02
-    clock_frames = clock_frames + 1
-    if clock_frames == 300 and (dt_avg < 1 / 400 or dt_avg > 1 / 12) then
-        use_clock = false                                 -- relogio nao confiavel: assume 60 FPS
-        log(string.format("camera_dinamica: relogio fora do esperado (dt medio %.4f s); usando 60 FPS fixo", dt_avg))
-        return 1 / 60
+    local now = os.time()
+    wt_frames = wt_frames + 1
+    if wt_last == nil then
+        wt_last, wt_frames = now, 0
+    elseif now ~= wt_last then
+        local secs = now - wt_last
+        if wt_valid and secs >= 1 and secs <= 3 and wt_frames > 0 then
+            local f = wt_frames / secs
+            if f < 10 then f = 10 elseif f > 300 then f = 300 end
+            fps_est = fps_est + (f - fps_est) * 0.5
+        end
+        wt_valid = true            -- a primeira janela (parcial) nao vale
+        wt_last, wt_frames = now, 0
     end
-    return dt
+    return 1 / fps_est
 end
-local function alpha(sm, dt)
-    if sm >= 1 then return 1 end
-    if sm <= 0 then return 0 end
-    return 1 - (1 - sm) ^ (dt * 60)
+
+-- suavizacao de 2a ordem (criticamente amortecida, estilo "SmoothDamp"): comeca e termina suave,
+-- com velocidade maxima. st = { v = velocidade }.
+local function smoothdamp(cur, target, st, smooth_time, max_speed, dt)
+    if smooth_time < 0.05 then smooth_time = 0.05 end
+    local omega = 2 / smooth_time
+    local x = omega * dt
+    local e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+    local change = cur - target
+    local max_change = max_speed * smooth_time
+    if change > max_change then change = max_change elseif change < -max_change then change = -max_change end
+    local tgt2 = cur - change
+    local tmp = (st.v + omega * change) * dt
+    st.v = (st.v - omega * tmp) * e
+    local out = tgt2 + (change + tmp) * e
+    if (target - cur > 0) == (out > target) then out = target; st.v = (out - target) / dt end
+    return out
 end
 
 local function player_x(g, i)
@@ -336,10 +361,63 @@ local function smoothstep(u)
     return u * u * (3 - 2 * u)
 end
 
-local function apply(t, extra)  -- t: 0 = aberta, 1 = fechada; extra[nome] soma ao valor
+-- Perfil trapezoidal PLANEJADO: acelera com a_max ate a velocidade de cruzeiro, segue, e FREIA a tempo
+-- (v <= sqrt(2*a*distancia_restante)) para chegar ao alvo com velocidade ~0: sem estouro e sem parada seca.
+-- Alvo mudando no meio do caminho (inversao): a velocidade so pode mudar a_max por segundo, entao nunca ha tranco.
+-- st = { cur, v }; vmax em unidades/s; tt = segundos para atingir a velocidade de cruzeiro (a_max = vmax/tt).
+local function ramp(st, target, vmax, tt, dt)
+    local amax = vmax / math.max(tt, 0.05)
+    local e = target - st.cur
+    local ae = math.abs(e)
+    -- ae/tt: perto do alvo a velocidade e proporcional ao que falta (aproximacao suave, sem perseguir ruido pequeno);
+    -- piso de 2% de vmax para a cauda terminar em tempo finito, sem salto
+    local vdes = math.min(vmax, math.sqrt(2 * amax * ae), math.max(ae / math.max(tt, 0.05), 0.02 * vmax), ae / dt)
+    if e < 0 then vdes = -vdes end
+    local dv = vdes - st.v
+    local lim = amax * dt
+    if dv > lim then dv = lim elseif dv < -lim then dv = -lim end
+    st.v = st.v + dv
+    local step = st.v * dt
+    if ae <= math.abs(step) and step * e >= 0 then
+        st.cur = target; st.v = 0
+    else
+        st.cur = st.cur + step
+    end
+    return st.cur
+end
+
+-- ===== vista-alvo por parametro e saida suavizada =====
+-- Para cada parametro (distancia, altura...): alvo = mistura de DUAS vistas que ja incluem a lateral:
+--   aberta(s) = aberta + extra*s            fechada(s) = fechada + extra*side_in_close*s
+--   alvo = aberta(s) + (fechada(s) - aberta(s)) * c        (c = fechamento 0..1, s = lateral 0..1)
+-- e a saida anda com 'ramp' (perfil trapezoidal planejado) com LIMITE DE VELOCIDADE em unidades do proprio parametro
+-- (curso total / min_time), para a camera nunca "pular" mesmo que a bola va longe de repente.
+local P_ST = {}      -- estado por parametro: { cur, v }
+local function side_of(p)
+    if p[1] == "dist" then return cfg.side_dist elseif p[1] == "altura" then return cfg.side_height end
+    return 0
+end
+local function param_target(p, c, sd)
+    local o, cl, so = cfg[p[3]], cfg[p[4]], side_of(p)
+    local open_t = o + so * sd
+    local close_t = cl + so * cfg.side_in_close * sd
+    return open_t + (close_t - open_t) * c
+end
+local function param_range(p)
+    local o, cl, so = cfg[p[3]], cfg[p[4]], side_of(p)
+    local r = math.max(math.abs(o + so - cl), math.abs(o - cl), math.abs(so), 1)
+    return r
+end
+local function drive(c, sd, dt, tt, min_time)
     for _, p in ipairs(PARAMS) do
-        local a, b = cfg[p[3]], cfg[p[4]]
-        if math.abs(a - b) > 1e-6 then wf(p[2], a + (b - a) * t + ((extra and extra[p[1]]) or 0)) end
+        local o, cl = cfg[p[3]], cfg[p[4]]
+        if math.abs(o - cl) > 1e-6 or side_of(p) ~= 0 then
+            local tgt = param_target(p, c, sd)
+            local st = P_ST[p[1]]
+            if not st then st = { cur = tgt, v = 0 }; P_ST[p[1]] = st end
+            ramp(st, tgt, param_range(p) / min_time, tt, dt)
+            wf(p[2], st.cur)
+        end
     end
     was_writing = true
 end
@@ -347,16 +425,46 @@ end
 local function restore_close()
     -- volta ao ajuste "fechado" (= sua Dynamic Wide normal)
     for _, p in ipairs(PARAMS) do
-        local a, b = cfg[p[3]], cfg[p[4]]
-        if math.abs(a - b) > 1e-6 then wf(p[2], b) end
+        local o, cl = cfg[p[3]], cfg[p[4]]
+        if math.abs(o - cl) > 1e-6 or side_of(p) ~= 0 then wf(p[2], cl) end
     end
+    P_ST = {}
     was_writing = false
+end
+
+-- ===== traco (diagnostico): guarda os ultimos ~15 s; F10 salva em camera_dinamica_trace.csv =====
+local TR_N = 900
+local TR = { t = {}, bx = {}, bz = {}, px = {}, pz = {}, c = {}, sd = {}, d = {}, h = {} }
+local tr_i, tr_count = 0, 0
+local function tr_push(bx, bz, px, pz, c, sd)
+    tr_i = tr_i % TR_N + 1
+    tr_count = math.min(tr_count + 1, TR_N)
+    TR.t[tr_i] = frame_no; TR.bx[tr_i] = bx; TR.bz[tr_i] = bz; TR.px[tr_i] = px; TR.pz[tr_i] = pz
+    TR.c[tr_i] = c; TR.sd[tr_i] = sd
+    TR.d[tr_i] = P_ST.dist and P_ST.dist.cur or 0; TR.h[tr_i] = P_ST.altura and P_ST.altura.cur or 0
+end
+local function dump_trace(ctx)
+    local f = io.open(ctx.sider_dir .. "\\camera_dinamica_trace.csv", "wt")
+    if not f then log("camera_dinamica: nao consegui gravar camera_dinamica_trace.csv"); return end
+    f:write(string.format("# camera_dinamica %s fps=%.1f follow=%.2f transition=%.2f min_time=%.2f side_in_close=%.2f\n", m.version, fps_est, cfg.follow, cfg.transition, cfg.min_time, cfg.side_in_close))
+    f:write("quadro,bola_x,bola_z,jogada_x,jogada_z,fechamento,lateral,dist,altura\n")
+    local first = (tr_count == TR_N) and (tr_i % TR_N + 1) or 1
+    for k = 0, tr_count - 1 do
+        local i = (first + k - 1) % TR_N + 1
+        f:write(string.format("%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f\n", TR.t[i], TR.bx[i], TR.bz[i], TR.px[i], TR.pz[i], TR.c[i], TR.sd[i], TR.d[i], TR.h[i]))
+    end
+    f:close()
+    log(string.format("camera_dinamica: TRACO salvo (%d quadros) em camera_dinamica_trace.csv", tr_count))
+    last_info = "traco salvo (F10)"
 end
 
 function m.set_teams(ctx, home, away)
     calib = nil
     pending_auto = true
     t_smooth = 0
+    side_smooth = 0
+    P_ST = {}
+    play_x, play_z = nil, nil
     last_ball = nil
     lost_frames = 0
     dumped = false
@@ -385,6 +493,8 @@ function m.key_down(ctx, vkey)
         mode = (mode + 1) % 4
         if mode == 3 and was_writing then restore_close() end
         log("camera_dinamica: modo " .. mode_names[mode])
+    elseif vkey == 0x79 then       -- F10: salva o traco dos ultimos ~15 s (use logo depois de ver um tranco)
+        dump_trace(ctx)
     elseif vkey == 0x76 or vkey == 0x77 then   -- F7 direita / F8 esquerda
         local g = u64(base + G_OFF)
         if valid(g) then
@@ -413,10 +523,8 @@ function m.display_frame(ctx)
             if miss_frames == 240 and cfg.debug == 1 and not dumped then dumped = true; dump_nodes(g) end
         end
         if was_writing and last_ball then   -- ja houve bola nesta partida: relaxa para a vista aberta
-            local k = 1 - alpha(cfg.smooth, dt)
-            t_smooth = t_smooth * k
-            side_smooth = side_smooth * k
-            apply(t_smooth, nil)
+            drive(0, 0, dt, cfg.transition, cfg.min_time)
+            dbg.t = 0
         end
         return
     end
@@ -425,58 +533,63 @@ function m.display_frame(ctx)
         if calibrate(g, cfg.first_half_dir, "auto") then pending_auto = false end
     end
 
+    -- 1) "lugar da jogada": a bola filtrada. Passes longos e rebotes nao fazem a camera bombear.
+    if play_x == nil then
+        play_x, play_z = bx, bz
+    else
+        local a = 1 - math.exp(-dt / math.max(cfg.follow, 0.02))
+        play_x = play_x + (bx - play_x) * a
+        play_z = play_z + (bz - play_z) * a
+    end
+
+    -- 2) fechamento c (0 = vista aberta, 1 = fechada) pela posicao da jogada ao longo do campo
     local dir = attack_dir(g)
     dbg.bx, dbg.bz = bx, bz
+    local d_att
     if dir then
         dbg.dir = dir
-        dbg.d = HALF_LEN - dir * bx          -- distancia (em x) ate a linha de fundo adversaria
-    end
-    local target
-    if mode == 1 then target = 1
-    elseif mode == 2 then target = 0
+        d_att = HALF_LEN - dir * play_x       -- distancia (em x) ate a linha de fundo adversaria
     else
-        local span = cfg.near_start - cfg.near_end
-        if span < 1 then span = 1 end
-        local dspan = cfg.def_start - cfg.def_end
-        if dspan < 1 then dspan = 1 end
+        d_att = HALF_LEN - math.abs(play_x)
+    end
+    dbg.d = d_att
+    local c
+    if mode == 1 then c = 1
+    elseif mode == 2 then c = 0
+    else
+        local span = math.max(cfg.near_start - cfg.near_end, 1)
+        local dspan = math.max(cfg.def_start - cfg.def_end, 1)
+        c = smoothstep((cfg.near_start - d_att) / span)
         if dir then
-            -- assimetrico: ataque fecha por completo; a propria area fecha so ate def_strength
-            local d_own = HALF_LEN + dir * bx
-            local t_att = smoothstep((cfg.near_start - dbg.d) / span)
-            local t_def = cfg.def_strength * smoothstep((cfg.def_start - d_own) / dspan)
-            target = (t_att > t_def) and t_att or t_def
+            local d_own = HALF_LEN + dir * play_x
+            local c_def = cfg.def_strength * smoothstep((cfg.def_start - d_own) / dspan)
+            if c_def > c then c = c_def end
         else
-            -- sem saber o lado: simetrico (fecha perto de qualquer um dos dois gols)
-            local d = HALF_LEN - math.abs(bx)
-            target = smoothstep((cfg.near_start - d) / span)
             last_info = "ok (simetrico: sem calibracao do lado)"
         end
     end
-    -- previa: enquanto edita uma linha ABERTA/FECHADA no overlay, mostra aquela vista
-    local sm = cfg.smooth
+
+    -- 3) lateral sd (0..1) pela largura: o outro lado do campo nao pode sumir quando a jogada esta numa lateral
+    local span2 = math.max(cfg.side_end - cfg.side_start, 1)
+    local gain = (play_z < 0) and cfg.side_top or cfg.side_bottom
+    local sd = gain * smoothstep((math.abs(play_z) - cfg.side_start) / span2)
+
+    -- previa: enquanto edita uma linha ABERTA/FECHADA no overlay, mostra aquela vista (rapido)
+    local tt, mtime = cfg.transition, cfg.min_time
     if overlay_active() and EDIT[sel][6] then
-        target = (EDIT[sel][6] == "c") and 1 or 0
-        if sm < 0.15 then sm = 0.15 end
+        c = (EDIT[sel][6] == "c") and 1 or 0
+        sd = 0
+        tt, mtime = math.min(tt, 0.3), math.min(mtime, 0.8)
         last_info = "PREVIA: " .. ((EDIT[sel][6] == "c") and "vista FECHADA" or "vista ABERTA")
     end
-    local al = alpha(sm, dt)
-    t_smooth = t_smooth + (target - t_smooth) * al
+
+    drive(c, sd, dt, tt, mtime)
+    dbg.t = c
+    tr_push(bx, bz, play_x, play_z, c, sd)
     if cfg.debug == 1 and frame_no % 20 == 0 then
-        log(string.format("cd: bola x=%.1f y=%.1f z=%.1f | dir=%s d_adv=%.1f | alvo=%.2f t=%.2f | modo=%d",
-            bx, by, bz, tostring(dir), dbg.d, target, t_smooth, mode))
+        log(string.format("cd: bola x=%.1f z=%.1f | jogada x=%.1f z=%.1f | dir=%s d_adv=%.1f | c=%.2f sd=%.2f | modo=%d",
+            bx, bz, play_x, play_z, tostring(dir), d_att, c, sd, mode))
     end
-    dbg.t = t_smooth
-    -- abre mais quando a bola esta perto de uma lateral (para o outro lado do campo nao sumir)
-    local side_t = 0
-    if bz then
-        local span2 = cfg.side_end - cfg.side_start
-        if span2 < 1 then span2 = 1 end
-        local gain = (bz < 0) and cfg.side_top or cfg.side_bottom
-        side_t = gain * smoothstep((math.abs(bz) - cfg.side_start) / span2)
-    end
-    side_smooth = side_smooth + (side_t - side_smooth) * al
-    local k = side_smooth * (1 - t_smooth)
-    apply(t_smooth, { dist = cfg.side_dist * k, altura = cfg.side_height * k })
     if dir and not (overlay_active() and EDIT[sel][6]) then last_info = "ok" end
 end
 
@@ -487,11 +600,11 @@ function m.overlay_on(ctx)
         lines[#lines + 1] = string.format("%s %-33s %8.3f", (i == sel) and "--->" or "    ", it[1], cfg[it[2]])
     end
     return string.format(
-        "camera_dinamica %s | modo: %s | %s\nbola x=%.1f z=%.1f | ataque dir=%d | dist. gol=%.1f | fechamento=%.2f | %.0f fps\n[F6] modo  [F7] ataco p/ DIREITA  [F8] ataco p/ ESQUERDA   |   PgUp/PgDn escolhe, Delete diminui, Insert aumenta (salva sozinho)\n%s",
-        m.version, mode_names[mode], last_info, dbg.bx, dbg.bz or 0, dbg.dir, dbg.d, dbg.t, (use_clock and dt_avg > 0) and (1 / dt_avg) or 60, table.concat(lines, "\n"))
+        "camera_dinamica %s | modo: %s | %s\nbola x=%.1f z=%.1f | ataque dir=%d | dist. gol=%.1f | fechamento=%.2f | %.0f fps\n[F6] modo  [F7] ataco p/ DIREITA  [F8] ataco p/ ESQUERDA  [F10] salva traco (use logo apos ver um tranco)\nPgUp/PgDn escolhe, Delete diminui, Insert aumenta (salva sozinho)\n%s",
+        m.version, mode_names[mode], last_info, dbg.bx, dbg.bz or 0, dbg.dir, dbg.d, dbg.t, fps_est, table.concat(lines, "\n"))
 end
 
-m._teste = { get_ball = function(g) return get_ball(g) end, estado = function() return ball_state, ball_node end, alpha = alpha }
+m._teste = { ramp = ramp, get_ball = function(g) return get_ball(g) end, estado = function() return ball_state, ball_node end, smoothdamp = smoothdamp, frame_dt = frame_dt, set_fps = function(f) fps_est = f end }
 
 function m.init(ctx)
     base = memory.get_process_info().base
