@@ -1,4 +1,4 @@
--- camera_dinamica.lua  v0.4
+-- camera_dinamica.lua  v1.4
 -- Camera ABERTA na defesa/meio e FECHADA (sua Dynamic Wide custom) perto do gol adversario.
 -- Parametros (descobertos com o camtune): distancia da camera da Dynamic Wide = 0x14260b8fc
 --   (28.70 original; valor alto = camera longe/aberta, valor baixo = perto).
@@ -7,7 +7,7 @@
 --          F7 = "estou atacando para a DIREITA"   F8 = "estou atacando para a ESQUERDA"
 -- Configuracao: camera_dinamica.ini (na pasta do Sider); Shift+R recarrega.
 local m = {}
-m.version = "1.2.1"
+m.version = "1.4"
 
 -- ===== enderecos (FL27, exe sem ASLR; validados em 2026-11-06) =====
 local G_OFF     = 0x36f3dc8   -- ponteiro do gerenciador da partida
@@ -128,35 +128,70 @@ local last_info = "aguardando partida"
 local dbg = { d = 0, t = 0, dir = 0, bx = 0, bz = 0 }
 local was_writing = false
 
-local ball_node = nil          -- indice do no que tem a bola (varia entre partida e treino)
--- so le objetos da mesma area de memoria dos jogadores (evita ler enderecos nao mapeados)
-local function in_pool(g, node)
+-- ===== bola =====
+-- A posicao da bola fica em +0xa80 de varios objetos apontados pelos nos de G, sempre REPLICADA em nos vizinhos.
+-- Os objetos "de bola" ficam nos nos mais altos (0xed..0xf0 em partida); copias em objetos de jogador ficam abaixo.
+-- Regra: entre os grupos de nos vizinhos com valores identicos, vale o de no mais alto. Se esse grupo estiver
+-- guardado fora do campo (replay/pausa: z=100), a bola esta "fora de jogo" (nao e erro).
+local ball_node = nil          -- no atual da bola
+local last_logged_node = nil
+local ball_state = "procurando"   -- "ok" | "fora" (guardada fora do campo) | "procurando"
+local NODE_MAIN_MIN = 0xe3     -- faixa validada (partida, treino, liga)
+
+local function in_pool(g, node)   -- so le objetos da mesma area de memoria dos jogadores
     local p0 = u64(g + PL_NODE * 0x28 + 0x20)
     return valid(p0) and node > p0 - 0x800000 and node < p0 + 0x800000
 end
 
-local function read_node_ball(g, n)
+local function node_xyz(g, n)
     local node = u64(g + n * 0x28 + 0x20)
     if not valid(node) or not in_pool(g, node) then return nil end
     local a = node + BALL_POS
     local x, y, z = rf(a), rf(a + 4), rf(a + 8)
     if not (finite(x) and finite(y) and finite(z)) then return nil end
     if x == 0 and y == 0 and z == 0 then return nil end
-    if math.abs(x) > 75 or math.abs(z) > 50 or y < -2 or y > 40 then return nil end
     return x, y, z
 end
+local function on_pitch(x, y, z) return math.abs(x) <= 62 and math.abs(z) <= 44 and y > -1 and y < 40 end
+local function parked(x, y, z)    -- bola guardada fora do campo pelo jogo
+    return y > -1 and y < 3 and (math.abs(z) >= 80 or math.abs(x) >= 80) and math.abs(x) < 500 and math.abs(z) < 500
+end
 
--- a bola e replicada em varios nos vizinhos: so aceita se o no seguinte tiver os MESMOS valores
-local function read_ball_checked(g, n)
-    local x, y, z = read_node_ball(g, n)
-    if not x then return nil end
-    local x2, y2, z2 = read_node_ball(g, n + 1)
-    if x2 == x and y2 == y and z2 == z then return x, y, z end
+-- tamanho do grupo de nos vizinhos (n, n+1, ...) com exatamente os mesmos valores
+local function run_len(g, n, x, y, z)
+    local len = 1
+    while len < 12 do
+        local x2, y2, z2 = node_xyz(g, n + len)
+        if x2 ~= x or y2 ~= y or z2 ~= z then break end
+        len = len + 1
+    end
+    return len
+end
+
+-- procura de cima para baixo o primeiro grupo valido; devolve no, x, y, z
+local function scan(g, lo, hi, minlen)
+    local n = hi
+    while n >= lo do
+        local x, y, z = node_xyz(g, n)
+        if x and (on_pitch(x, y, z) or parked(x, y, z)) then
+            local start = n            -- desce ate o comeco do grupo
+            while start > lo do
+                local x2, y2, z2 = node_xyz(g, start - 1)
+                if x2 ~= x or y2 ~= y or z2 ~= z then break end
+                start = start - 1
+            end
+            if n - start + 1 >= minlen then return start, x, y, z end
+            n = start - 1
+        else
+            n = n - 1
+        end
+    end
     return nil
 end
 
 local miss_frames = 0
-local function dump_nodes(g)   -- diagnostico (1x): o que ha nos nos de G, para mapear o Master League
+local dumped = false
+local function dump_nodes(g)   -- diagnostico (so com debug = 1, uma vez por partida)
     log("camera_dinamica: DIAGNOSTICO bola nao encontrada; nos de G (indice ptr x y z):")
     for n = 0x90, 0xf6 do
         local node = u64(g + n * 0x28 + 0x20)
@@ -168,44 +203,104 @@ local function dump_nodes(g)   -- diagnostico (1x): o que ha nos nos de G, para 
 end
 
 local cand = nil
-local function get_ball(g)
-    if ball_node then
-        local x, y, z = read_ball_checked(g, ball_node)
-        if x then return x, y, z end
-        ball_node = nil
+local last_ball = nil            -- ultima posicao valida {x,y,z}
+local lost_frames = 0
+local HOLD_FRAMES = 180          -- segura a ultima posicao por ~3 s (gol, reposicao, replay)
+local rescan_in = 0
+
+local function set_node(n, how)
+    ball_node = n
+    if n ~= last_logged_node then
+        log(string.format("camera_dinamica: bola no no 0x%x%s", n, how or ""))
+        last_logged_node = n
     end
-    -- 1) faixa onde ja foi validado (partida normal e treino); 2) depois, faixa mais larga para baixo
-    for n = 0xe3, BALL_NODE_MAX do
-        local x, y, z = read_ball_checked(g, n)
-        if x then
-            ball_node = n
-            log(string.format("camera_dinamica: bola encontrada no no 0x%x", n))
-            return x, y, z
+end
+
+-- devolve x, y, z da bola EM JOGO, ou nil (ball_state diz se esta "fora" ou "procurando")
+local function get_ball_raw(g)
+    rescan_in = rescan_in - 1
+    if ball_node and rescan_in > 0 then
+        local x, y, z = node_xyz(g, ball_node)
+        if x and run_len(g, ball_node, x, y, z) >= 2 then
+            if on_pitch(x, y, z) then ball_state = "ok"; return x, y, z end
+            if parked(x, y, z) then ball_state = "fora"; return nil end
         end
     end
-    -- faixa larga (so para modos desconhecidos, ex. Master League): um candidato so vale
-    -- depois de se MOVER varias vezes; dado parado nunca e bola
+    -- (re)procura: faixa validada primeiro, grupo de no mais alto
+    rescan_in = 60
+    local n, x, y, z = scan(g, NODE_MAIN_MIN, BALL_NODE_MAX, 2)
+    if n then
+        cand = nil
+        set_node(n)
+        if on_pitch(x, y, z) then ball_state = "ok"; return x, y, z end
+        ball_state = "fora"; return nil
+    end
+    ball_node = nil
+    ball_state = "procurando"
+    -- faixa larga (modos desconhecidos): exige grupo de 3+ nos E que o valor se mova varias vezes
+    rescan_in = 0
     if cand then
-        local x, y, z = read_ball_checked(g, cand.n)
-        if not x then
+        local cx, cy, cz = node_xyz(g, cand.n)
+        if not cx or not on_pitch(cx, cy, cz) or run_len(g, cand.n, cx, cy, cz) < 3 then
             cand = nil
         else
-            if math.abs(x - cand.x) > 0.05 or math.abs(z - cand.z) > 0.05 then cand.moves = cand.moves + 1 end
-            cand.x, cand.z = x, z
+            if math.abs(cx - cand.x) > 0.05 or math.abs(cz - cand.z) > 0.05 then cand.moves = cand.moves + 1 end
+            cand.x, cand.z = cx, cz
             if cand.moves >= 8 then
-                ball_node = cand.n
-                log(string.format("camera_dinamica: bola encontrada no no 0x%x (faixa ampla, confirmada por movimento)", cand.n))
-                cand = nil
-                return x, y, z
+                set_node(cand.n, " (faixa ampla, confirmada por movimento)")
+                cand = nil; rescan_in = 60; ball_state = "ok"
+                return cx, cy, cz
             end
         end
         return nil
     end
-    for n = 0xe2, BALL_NODE_MIN, -1 do
-        local x, y, z = read_ball_checked(g, n)
-        if x then cand = { n = n, x = x, z = z, moves = 0 }; break end
+    local wn, wx, wy, wz = scan(g, BALL_NODE_MIN, NODE_MAIN_MIN - 1, 3)
+    if wn and on_pitch(wx, wy, wz) then cand = { n = wn, x = wx, z = wz, moves = 0 } end
+    return nil
+end
+
+local function get_ball(g)
+    local x, y, z = get_ball_raw(g)
+    if x then
+        if lost_frames >= 10 and cfg.debug == 1 then
+            log(string.format("camera_dinamica: bola de volta apos %d frames (x=%.1f z=%.1f)", lost_frames, x, z))
+        end
+        lost_frames = 0
+        last_ball = { x, y, z }
+        return x, y, z
+    end
+    lost_frames = lost_frames + 1
+    if lost_frames == 10 and cfg.debug == 1 then
+        log("camera_dinamica: sem bola em jogo (" .. ball_state .. ")")
+    end
+    if last_ball and lost_frames <= HOLD_FRAMES then
+        return last_ball[1], last_ball[2], last_ball[3]   -- mantem o ultimo valor, sem "piscar"
     end
     return nil
+end
+
+-- ===== tempo: suavizacao independente do FPS =====
+-- cfg.smooth continua sendo "fracao por quadro a 60 FPS"; aqui vira fracao para o tempo real do quadro
+local last_clock, dt_avg, use_clock, clock_frames = nil, 1 / 60, true, 0
+local function frame_dt()
+    if not (use_clock and os and os.clock) then return 1 / 60 end
+    local c = os.clock()
+    local dt = last_clock and (c - last_clock) or (1 / 60)
+    last_clock = c
+    if dt <= 0 or dt > 0.25 then return 1 / 60 end      -- pausa, carregamento, 1o quadro
+    dt_avg = dt_avg + (dt - dt_avg) * 0.02
+    clock_frames = clock_frames + 1
+    if clock_frames == 300 and (dt_avg < 1 / 400 or dt_avg > 1 / 12) then
+        use_clock = false                                 -- relogio nao confiavel: assume 60 FPS
+        log(string.format("camera_dinamica: relogio fora do esperado (dt medio %.4f s); usando 60 FPS fixo", dt_avg))
+        return 1 / 60
+    end
+    return dt
+end
+local function alpha(sm, dt)
+    if sm >= 1 then return 1 end
+    if sm <= 0 then return 0 end
+    return 1 - (1 - sm) ^ (dt * 60)
 end
 
 local function player_x(g, i)
@@ -262,6 +357,11 @@ function m.set_teams(ctx, home, away)
     calib = nil
     pending_auto = true
     t_smooth = 0
+    last_ball = nil
+    lost_frames = 0
+    dumped = false
+    ball_node = nil
+    cand = nil
     last_info = "partida carregando"
 end
 
@@ -302,11 +402,22 @@ function m.display_frame(ctx)
         last_info = "sem partida"
         return
     end
+    local dt = frame_dt()
     local bx, by, bz = get_ball(g)
     if not bx then
-        last_info = "bola nao encontrada"
-        miss_frames = miss_frames + 1
-        if miss_frames == 240 then dump_nodes(g) end
+        if ball_state == "fora" then
+            last_info = "bola fora de jogo (replay/pausa)"
+        else
+            last_info = "bola nao encontrada"
+            miss_frames = miss_frames + 1
+            if miss_frames == 240 and cfg.debug == 1 and not dumped then dumped = true; dump_nodes(g) end
+        end
+        if was_writing and last_ball then   -- ja houve bola nesta partida: relaxa para a vista aberta
+            local k = 1 - alpha(cfg.smooth, dt)
+            t_smooth = t_smooth * k
+            side_smooth = side_smooth * k
+            apply(t_smooth, nil)
+        end
         return
     end
     miss_frames = 0
@@ -348,7 +459,8 @@ function m.display_frame(ctx)
         if sm < 0.15 then sm = 0.15 end
         last_info = "PREVIA: " .. ((EDIT[sel][6] == "c") and "vista FECHADA" or "vista ABERTA")
     end
-    t_smooth = t_smooth + (target - t_smooth) * sm
+    local al = alpha(sm, dt)
+    t_smooth = t_smooth + (target - t_smooth) * al
     if cfg.debug == 1 and frame_no % 20 == 0 then
         log(string.format("cd: bola x=%.1f y=%.1f z=%.1f | dir=%s d_adv=%.1f | alvo=%.2f t=%.2f | modo=%d",
             bx, by, bz, tostring(dir), dbg.d, target, t_smooth, mode))
@@ -362,7 +474,7 @@ function m.display_frame(ctx)
         local gain = (bz < 0) and cfg.side_top or cfg.side_bottom
         side_t = gain * smoothstep((math.abs(bz) - cfg.side_start) / span2)
     end
-    side_smooth = side_smooth + (side_t - side_smooth) * sm
+    side_smooth = side_smooth + (side_t - side_smooth) * al
     local k = side_smooth * (1 - t_smooth)
     apply(t_smooth, { dist = cfg.side_dist * k, altura = cfg.side_height * k })
     if dir and not (overlay_active() and EDIT[sel][6]) then last_info = "ok" end
@@ -375,9 +487,11 @@ function m.overlay_on(ctx)
         lines[#lines + 1] = string.format("%s %-33s %8.3f", (i == sel) and "--->" or "    ", it[1], cfg[it[2]])
     end
     return string.format(
-        "camera_dinamica %s | modo: %s | %s\nbola x=%.1f z=%.1f | ataque dir=%d | dist. gol=%.1f | fechamento=%.2f\n[F6] modo  [F7] ataco p/ DIREITA  [F8] ataco p/ ESQUERDA   |   PgUp/PgDn escolhe, Delete diminui, Insert aumenta (salva sozinho)\n%s",
-        m.version, mode_names[mode], last_info, dbg.bx, dbg.bz or 0, dbg.dir, dbg.d, dbg.t, table.concat(lines, "\n"))
+        "camera_dinamica %s | modo: %s | %s\nbola x=%.1f z=%.1f | ataque dir=%d | dist. gol=%.1f | fechamento=%.2f | %.0f fps\n[F6] modo  [F7] ataco p/ DIREITA  [F8] ataco p/ ESQUERDA   |   PgUp/PgDn escolhe, Delete diminui, Insert aumenta (salva sozinho)\n%s",
+        m.version, mode_names[mode], last_info, dbg.bx, dbg.bz or 0, dbg.dir, dbg.d, dbg.t, (use_clock and dt_avg > 0) and (1 / dt_avg) or 60, table.concat(lines, "\n"))
 end
+
+m._teste = { get_ball = function(g) return get_ball(g) end, estado = function() return ball_state, ball_node end, alpha = alpha }
 
 function m.init(ctx)
     base = memory.get_process_info().base

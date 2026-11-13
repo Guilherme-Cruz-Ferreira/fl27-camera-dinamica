@@ -54,17 +54,19 @@ A **lower** distance/height value means a **closer** camera. Selecting an *ABERT
 | `side_dist` / `side_height` | extra distance / height added near a touchline |
 | `side_top` / `side_bottom` | gain (0–2) of that extra opening on the top / bottom touchline |
 | `smooth` | per-frame smoothing (lower = slower transition) |
-| `debug` | 1 logs the ball position to `sider.log` (diagnostics) |
+| `debug` | 1 logs the ball position and a node dump when the ball is not found to `sider.log` (diagnostics) |
 
 ## How it works
 The Dynamic Wide camera reads its distance (`0x14260b8fc`, 28.7 by default) and height (`0x14260b900`, 35.4) from a table in the executable, and the game re-reads them every frame, so the script interpolates them between "open" and "closed". The ball position is read from the match structure (`*(base+0x36f3dc8)`, nodes 0xe3–0xf1, offset `+0xa80`; the node differs between a real match and training mode, so it looks for the one whose neighbour holds identical values). The attacking direction comes from a goalkeeper's position (|x| > 43) plus F7/F8.
 
-`tools/camtune.lua` is a live tuner for discovering what each camera parameter does.
+`tests/test_ball_detection.lua` runs the ball detection against simulated memory (any Lua 5.3: `lua tests/test_ball_detection.lua camera_dinamica.lua <tmpdir>`). `tools/camtune.lua` is a live tuner for discovering what each camera parameter does.
 
 ## Known issues
-- **Master League:** reported as not working there while Exhibition works. The ball sits in different memory nodes depending on the mode (match vs. training already differ), so the module also tries a wider search. This is **not confirmed fixed**: if the overlay shows "bola nao encontrada" (ball not found), the module writes a `DIAGNOSTICO` list of memory nodes to `sider.log` after ~4 s — please open an issue and paste that block.
+- **Master League:** reported as not working there while Exhibition works. The ball sits in different memory nodes depending on the mode (match vs. training already differ), and v1.4 reworked the detection. This is **not confirmed fixed**: if the overlay shows "bola nao encontrada" (ball not found), set `debug = 1` in `camera_dinamica.ini`, play a few seconds, and the module writes a `DIAGNOSTICO` list of memory nodes to `sider.log` — please open an issue and paste that block.
 
 ## Changelog
+- **1.4** — Ball detection rewritten: the ball position is replicated in neighbouring match-structure nodes, and the module now takes the *highest* replicated group (the real ball object) instead of the first one found, so it no longer follows look-alike data. A ball parked off the pitch by the game (replays, pauses) is treated as "out of play" instead of an error. The wide fallback search needs a group of 3+ nodes that actually moves. Smoothing is now time-based (`smooth` = fraction per frame at 60 FPS), so transitions take the same time at any frame rate; the overlay shows the measured FPS. Diagnostics are only logged with `debug = 1`. Verified with an offline test (`tests/test_ball_detection.lua`, simulated memory, 14 cases); in-game testing of this version is still limited.
+- **1.3** — When the ball is briefly lost (goals, restarts) the last position is held for ~3 s, then the camera relaxes to the open view.
 - **1.2.1** — Fixes a regression in 1.2: the wider ball search could latch onto a stray, static memory node and the camera stopped reacting (symmetric/dynamic mode "dead"). The wide search now only accepts a candidate after it has actually moved several times; the known node range is always tried first. **If you installed 1.2, update.**
 - **1.2** — Extra opening near touchlines (`side_*`), wider ball search, diagnostic dump, F6 only with the overlay page open.
 - **1.0** — Initial release.
