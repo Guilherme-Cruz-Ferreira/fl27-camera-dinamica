@@ -144,8 +144,16 @@ local r3 = runramp(60, 6, function(t) return 20 + ((math.floor(t / 0.4) % 2 == 0
 local tvn = 0; for i = 2, #r3 do tvn = tvn + math.abs(r3[i] - r3[i - 1]) end
 check("R ruido de +-2 no alvo: movimento total proximo do necessario (<= 30)", tvn <= 30, string.format("%.1f (necessario ~20)", tvn))
 
--- J) traco F10
+-- K) 2.1: depois de set_teams o modulo espera ~2,5 s (150 quadros) sem tocar na memoria da partida
 reset(); fresh(); ball(0xee, 0xef, 10, 0.11, -20)
+local d0 = (string.unpack("<f", memory.read(0x14260b8fc, 4)))
+for i = 1, 149 do m.display_frame({}) end
+local d1 = (string.unpack("<f", memory.read(0x14260b8fc, 4)))
+check("K espera 150 quadros apos set_teams sem escrever na camera", d0 == d1, string.format("%s -> %s", tostring(d0), tostring(d1)))
+
+-- J) traco F10 (depois da espera do carregamento)
+reset(); fresh(); ball(0xee, 0xef, 10, 0.11, -20)
+for i = 1, 150 do m.display_frame({}) end
 for i = 1, 120 do m.display_frame({}) end
 m.key_down({ sider_dir = arg[2] .. "/" }, 0x79)
 local fh = io.open(arg[2] .. "/\\camera_dinamica_trace.csv", "r")

@@ -1,13 +1,16 @@
--- camera_dinamica.lua  v2.0
+-- camera_dinamica.lua  v2.1
 -- Camera ABERTA na defesa/meio e FECHADA (sua Dynamic Wide custom) perto do gol adversario.
 -- Parametros (descobertos com o camtune): distancia da camera da Dynamic Wide = 0x14260b8fc
 --   (28.70 original; valor alto = camera longe/aberta, valor baixo = perto).
 --   Altura da camera da DW = 0x14260b900 (35.44 original; alto = camera la em cima, tipo blimp).
 -- Teclas:  F6 = modo (dinamico / forcar FECHADA / forcar ABERTA / desligado)
 --          F7 = "estou atacando para a DIREITA"   F8 = "estou atacando para a ESQUERDA"
+--          (F6/F7/F8 so com a pagina camera_dinamica aberta no overlay: outros modulos usam as mesmas teclas)
+-- Padrao (2.1): o perfil recomendado, testado em partidas (aberta e alta no meio, nao fecha na defesa,
+--          lateral discreta so no lado de cima).
 -- Configuracao: camera_dinamica.ini (na pasta do Sider); Shift+R recarrega.
 local m = {}
-m.version = "2.0"
+m.version = "2.1"
 
 -- ===== enderecos (FL27, exe sem ASLR; validados em 2026-11-06) =====
 local G_OFF     = 0x36f3dc8   -- ponteiro do gerenciador da partida
@@ -32,30 +35,32 @@ local cfg = {
     enabled = 1,
     debug = 0,                 -- 1: grava posicao da bola e decisao no sider.log (diagnostico)
     first_half_dir = 1,        -- +1: ataca para a direita (x+) no 1o tempo, -1: esquerda
-    near_start = 45,           -- a partir de quantos metros do gol comeca a fechar
-    near_end = 16,             -- a partir de quantos metros esta totalmente fechada
+    near_start = 23,           -- a partir de quantos metros do gol comeca a fechar
+    near_end = 5,             -- a partir de quantos metros esta totalmente fechada
     def_start = 35,            -- na propria defesa: a partir de quantos metros do SEU gol comeca a fechar
     def_end = 17,              -- ...e fecha ao maximo (a grande area tem 16,5 m)
-    def_strength = 0.6,        -- 0..1: quanto fecha na propria area (1 = igual ao ataque, 0 = nao fecha)
+    def_strength = 0,        -- 0..1: quanto fecha na propria area (1 = igual ao ataque, 0 = nao fecha)
     side_start = 12,           -- bola a partir de quantos metros do centro (eixo z) comeca a abrir extra
     side_end = 28,             -- ...e abre o maximo (campo tem +-34 m de largura)
     side_dist = 10,            -- distancia extra na lateral
-    side_height = 25,          -- altura extra na lateral
+    side_height = 5,          -- altura extra na lateral
     side_top = 1.0,            -- ganho na lateral de CIMA (z negativo, onde o campo some)
-    side_bottom = 0.3,         -- ganho na lateral de BAIXO
+    side_bottom = 0,         -- ganho na lateral de BAIXO
+    side_angle = 0,            -- angulo (inclinacao) extra na lateral (como o fan view: inclina em vez de so se afastar)
+    side_lat = 0,              -- parametro 'lateral' extra na lateral
     follow = 0.6,              -- segundos: a camera decide pelo 'lugar da jogada' (bola filtrada), nao pela bola instantanea
     transition = 0.9,          -- segundos para a camera atingir a velocidade de cruzeiro (maior = arranque/freada mais suaves)
     min_time = 2.5,            -- tempo minimo (s) para percorrer TODO o curso abrir<->fechar (limite de velocidade fisico)
     side_in_close = 0.35,      -- 0..1: quanto do extra da lateral continua na vista FECHADA (0 = nenhum)
     max_speed = 1.0,           -- (obsoleto desde a 2.0)
     smooth = 0.05,             -- (obsoleto desde a 1.5; mantido para nao quebrar o .ini)
-    dist_open = 40.0,   dist_close = 28.698,
+    dist_open = 60.0,   dist_close = 25.5,
     lat_open = 21.921,  lat_close = 21.921,
     angle_open = 0.20,  angle_close = 0.20,
-    height_open = 90.0, height_close = 35.442,
+    height_open = 30.0, height_close = 34.0,
 }
 local cfg_order = { "enabled", "debug", "first_half_dir", "near_start", "near_end",
-    "def_start", "def_end", "def_strength", "side_start", "side_end", "side_dist", "side_height", "side_top", "side_bottom", "follow", "transition", "min_time", "side_in_close", "max_speed", "smooth",
+    "def_start", "def_end", "def_strength", "side_start", "side_end", "side_dist", "side_height", "side_top", "side_bottom", "side_angle", "side_lat", "follow", "transition", "min_time", "side_in_close", "max_speed", "smooth",
     "dist_open", "dist_close", "lat_open", "lat_close", "angle_open", "angle_close",
     "height_open", "height_close" }
 
@@ -107,6 +112,12 @@ local EDIT = {
     { "lateral: altura extra",           "side_height",  2,    0,   150 },
     { "lateral de CIMA (ganho 0..1)",    "side_top",     0.1,  0,   2   },
     { "lateral de BAIXO (ganho 0..1)",   "side_bottom",  0.1,  0,   2   },
+    { "lateral: angulo extra",           "side_angle",   0.05, -2,  2   },
+    { "lateral: 'lateral' extra",        "side_lat",     1,    -40, 60  },
+    { "ABERTA: angulo",                  "angle_open",   0.05, -2,  2,  "o" },
+    { "FECHADA: angulo",                 "angle_close",  0.05, -2,  2,  "c" },
+    { "ABERTA: lateral",                 "lat_open",     1,    -10, 80, "o" },
+    { "FECHADA: lateral",                "lat_close",    1,    -10, 80, "c" },
     { "arranque/freada: segundos (maior = mais suave)", "transition", 0.1, 0.2, 6  },
     { "seguir a jogada: segundos (maior = menos nervoso)", "follow", 0.1, 0, 3 },
     { "tempo minimo abrir<->fechar (s)", "min_time",     0.25, 0.5, 10 },
@@ -120,10 +131,36 @@ local overlay_seen = -100
 -- ===== leitura de memoria =====
 local base
 local function valid(p) return p and p > 0x10000 and p < 0x7fffffffffff end
-local function u64(a) return memory.unpack("i64", memory.read(a, 8)) end
-local function rf(a) return memory.unpack("f", memory.read(a, 4)) end
+-- Leitura SEGURA: o jogo pode ter liberado/movido objetos enquanto a partida carrega; ler um ponteiro velho gerava uma
+-- violacao de acesso dentro do gancho (Wine: "KiUserCallbackDispatcher ignoring exception") e o jogo travava em laco.
+-- IsBadReadPtr trata a excecao por dentro e devolve 1 se o trecho nao pode ser lido; nesse caso devolvemos 0.
+-- (o Sider nao tem pcall: usa-se o ffi global, como os outros modulos)
+local bad_read = nil
+if ffi then
+    ffi.cdef[[int IsBadReadPtr(const void* lp, unsigned long long ucb);]]
+    bad_read = function(a, n) return ffi.C.IsBadReadPtr(ffi.cast("const void*", a), n) ~= 0 end
+end
+local function readable(a, n)
+    if not a then return false end
+    if type(a) ~= "number" then              -- base do exe chega como ponteiro (cdata): converte para numero
+        if not ffi then return true end
+        a = tonumber(ffi.cast("intptr_t", a))
+        if not a then return false end
+    end
+    if a < 0x10000 or a > 0x7fffffffffff then return false end
+    if bad_read then return not bad_read(a, n) end
+    return true
+end
+local function u64(a)
+    if not readable(a, 8) then return 0 end
+    return memory.unpack("i64", memory.read(a, 8))
+end
+local function rf(a)
+    if not readable(a, 4) then return 0/0 end
+    return memory.unpack("f", memory.read(a, 4))
+end
 local function wf(a, v) memory.write(a, memory.pack("f", v)) end
-local function finite(v) return v == v and v > -1e6 and v < 1e6 end
+local function finite(v) return type(v) == "number" and v == v and v > -1e6 and v < 1e6 end
 
 -- ===== estado =====
 local mode = 0                 -- 0 dinamico, 1 forcar FECHADA, 2 forcar ABERTA, 3 desligado
@@ -147,9 +184,11 @@ local last_logged_node = nil
 local ball_state = "procurando"   -- "ok" | "fora" (guardada fora do campo) | "procurando"
 local NODE_MAIN_MIN = 0xe3     -- faixa validada (partida, treino, liga)
 
-local function in_pool(g, node)   -- so le objetos da mesma area de memoria dos jogadores
-    local p0 = u64(g + PL_NODE * 0x28 + 0x20)
-    return valid(p0) and node > p0 - 0x800000 and node < p0 + 0x800000
+local function in_pool(g, node)   -- aceita qualquer ponteiro plausivel (alinhado, na faixa de usuario).
+    -- Antes exigia estar a 8 MB do bloco dos jogadores, mas com outros mods (handball, BG Gameplay, goalnets) o jogo
+    -- aloca a bola em outra area da memoria (ex.: 0x1e2d5080 contra jogadores em 0x352ff90). Valores lixo sao
+    -- descartados por finite()/on_pitch() e pela exigencia de grupo de nos vizinhos com valores identicos.
+    return valid(node) and node % 8 == 0
 end
 
 local function node_xyz(g, n)
@@ -395,6 +434,7 @@ end
 local P_ST = {}      -- estado por parametro: { cur, v }
 local function side_of(p)
     if p[1] == "dist" then return cfg.side_dist elseif p[1] == "altura" then return cfg.side_height end
+    if p[1] == "angulo" then return cfg.side_angle elseif p[1] == "lateral" then return cfg.side_lat end
     return 0
 end
 local function param_target(p, c, sd)
@@ -458,6 +498,7 @@ local function dump_trace(ctx)
     last_info = "traco salvo (F10)"
 end
 
+local warmup = 0
 function m.set_teams(ctx, home, away)
     calib = nil
     pending_auto = true
@@ -471,6 +512,7 @@ function m.set_teams(ctx, home, away)
     ball_node = nil
     cand = nil
     last_info = "partida carregando"
+    warmup = 150           -- ~2,5 s sem tocar na memoria da partida enquanto ela carrega
 end
 
 local function overlay_active() return frame_no - overlay_seen <= 3 end
@@ -495,7 +537,7 @@ function m.key_down(ctx, vkey)
         log("camera_dinamica: modo " .. mode_names[mode])
     elseif vkey == 0x79 then       -- F10: salva o traco dos ultimos ~15 s (use logo depois de ver um tranco)
         dump_trace(ctx)
-    elseif vkey == 0x76 or vkey == 0x77 then   -- F7 direita / F8 esquerda
+    elseif (vkey == 0x76 or vkey == 0x77) and overlay_active() then   -- F7 direita / F8 esquerda (só com a página aberta: F7/F8 também são do TFSE)
         local g = u64(base + G_OFF)
         if valid(g) then
             local dir0 = (vkey == 0x76) and 1 or -1
@@ -507,6 +549,7 @@ end
 function m.display_frame(ctx)
     frame_no = frame_no + 1
     if mode == 3 or cfg.enabled == 0 then return end
+    if warmup > 0 then warmup = warmup - 1; last_info = "partida carregando"; return end
     local g = u64(base + G_OFF)
     if not valid(g) then
         last_info = "sem partida"
